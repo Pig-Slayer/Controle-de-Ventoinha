@@ -1,0 +1,541 @@
+/*
+  CONTROLE DE VENTOINHA - ESP32
+  Modos disponiveis:
+  1) MANUAL     : PWM fixo definido pelo usuario (ex: PWM=50)
+  2) AUTO_RPM   : PID alternando entre SP Maximo e SP Minimo (saida limitada entre PWM_MIN e PWM_MAX)
+  3) AUTO_PWM   : PWM alternando automaticamente entre PWM_MIN e PWM_MAX
+
+  Placa: ESP32 DevKit V1 / ESP32-WROOM-32
+  PWM: GPIO 25 | Sensor Hall: GPIO 27
+
+  Comandos no Monitor Serial (115200 baud, Nova linha ou Both NL & CR):
+- PWMMIN=30        : define o PWM minimo (0 a PWM_MAX) para PID e AUTO_PWM
+- PWMMAX=100       : define o PWM maximo (PWM_MIN a 100) para PID e AUTO_PWM
+- MAXP=80          : define PWM_MAX e inicia o ciclo AUTO_PWM (PWM_MIN <-> PWM_MAX)
+- AUTOPWM          : ativa o modo AUTO_PWM com os limites atuais
+- MAX=4000 / SP=   : define o RPM maximo (1000 a 5000) e inicia o ciclo AUTO_RPM
+- MIN=1000         : altera o RPM minimo do ciclo AUTO_RPM (padrao: 1000 RPM)
+- AUTO             : ativa o modo AUTO_RPM com o MAX atual
+- PWM=50           : muda para modo MANUAL com PWM fixo (0 a 100%)
+- MANUAL           : muda para modo MANUAL mantendo o PWM atual
+- TEMPO=5          : tempo em segundos de cada etapa nos modos automaticos
+- KP= / KI= / KD=  : ajusta os ganhos do PID em tempo real
+- PPR=2            : altera pulsos por volta do sensor Hall
+- STOP             : desliga a ventoinha (PWM = 0% e volta para MANUAL)
+- STATUS           : mostra os parametros atuais
+- HELP             : lista os comandos
+*/
+
+#include <Arduino.h>
+#include <esp_arduino_version.h>
+#include <math.h>
+#include <stdlib.h>
+
+// -----------------------------------------------------------------------------
+// PINOS
+// -----------------------------------------------------------------------------
+#define PWM_PIN  25
+#define HALL_PIN 27
+
+// -----------------------------------------------------------------------------
+// CONFIGURACAO PWM
+// -----------------------------------------------------------------------------
+const uint32_t PWM_FREQ    = 1000;
+const uint8_t  PWM_RES     = 10;
+const uint32_t PWM_MAX_RAW = (1UL << PWM_RES) - 1UL;
+const uint8_t  PWM_CHANNEL = 0; // Usado apenas no Arduino-ESP32 2.x
+
+// -----------------------------------------------------------------------------
+// MODOS DE OPERACAO E CICLOS
+// -----------------------------------------------------------------------------
+enum ModoOperacao {
+  MODO_MANUAL,
+  MODO_AUTO_RPM,
+  MODO_AUTO_PWM
+};
+
+ModoOperacao modoAtual = MODO_MANUAL;
+
+const float RPM_LIMITE_MIN = 1000.0f;
+const float RPM_LIMITE_MAX = 5000.0f;
+
+float spMin  = 1000.0f; // Rotacao minima no ciclo AUTO_RPM
+float spMax  = 5000.0f; // Rotacao maxima no ciclo AUTO_RPM
+float pwmMin = 30.0f;   // PWM minimo (%) no PID (AUTO_RPM) e no AUTO_PWM
+float pwmMax = 100.0f;  // PWM maximo (%) no PID (AUTO_RPM) e no AUTO_PWM
+
+uint32_t tempoCicloMs  = 5000; // 5 segundos em cada etapa
+uint32_t ultimaTrocaMs = 0;
+bool cicloNaMaxima     = true;
+
+// -----------------------------------------------------------------------------
+// PARAMETROS PID (saida MV direta em % de PWM: pwmMin a pwmMax)
+// -----------------------------------------------------------------------------
+float Kp = 0.0193f;
+float Ki = 0.0097f;
+float Kd = 0.0f;
+
+float SP = 5000.0f;
+float PV = 0.0f;
+float MV = 0.0f;
+
+float erro       = 0.0f;
+float PVAnterior = 0.0f;
+float P          = 0.0f;
+float I          = 0.0f;
+float D          = 0.0f;
+
+float pwmManual     = 0.0f;
+float pwmPercentual = 0.0f;
+
+// -----------------------------------------------------------------------------
+// SENSOR HALL
+// -----------------------------------------------------------------------------
+float PPR = 2.0f;
+const uint32_t DEBOUNCE_US = 4500;
+
+volatile uint32_t pulsosHall    = 0;
+volatile uint32_t ultimoPulsoUs = 0;
+portMUX_TYPE muxHall = portMUX_INITIALIZER_UNLOCKED;
+
+// -----------------------------------------------------------------------------
+// AMOSTRAGEM E FILTRO
+// -----------------------------------------------------------------------------
+const uint32_t INTERVALO_MS = 100;
+uint32_t tempoAnterior      = 0;
+const float FILTRO_PV       = 0.5f;
+
+float frequencia = 0.0f;
+float rpmBruta   = 0.0f;
+
+// -----------------------------------------------------------------------------
+// FUNCOES DE PWM
+// -----------------------------------------------------------------------------
+bool iniciarPWM() {
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  return ledcAttach(PWM_PIN, PWM_FREQ, PWM_RES);
+#else
+  double freq = ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RES);
+  if (freq <= 0.0) return false;
+  ledcAttachPin(PWM_PIN, PWM_CHANNEL);
+  return true;
+#endif
+}
+
+void aplicarPWM(float percentual) {
+  percentual = constrain(percentual, 0.0f, 100.0f);
+  pwmPercentual = percentual;
+  uint32_t duty = (uint32_t)lroundf(PWM_MAX_RAW * percentual / 100.0f);
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(PWM_PIN, duty);
+#else
+  ledcWrite(PWM_CHANNEL, duty);
+#endif
+}
+
+// -----------------------------------------------------------------------------
+// INTERRUPCAO DO SENSOR HALL
+// -----------------------------------------------------------------------------
+void IRAM_ATTR contarPulso() {
+  const uint32_t agoraUs = micros();
+  if ((uint32_t)(agoraUs - ultimoPulsoUs) < DEBOUNCE_US) {
+    return;
+  }
+  ultimoPulsoUs = agoraUs;
+  portENTER_CRITICAL_ISR(&muxHall);
+  pulsosHall++;
+  portEXIT_CRITICAL_ISR(&muxHall);
+}
+
+// -----------------------------------------------------------------------------
+// MEDICAO DE RPM
+// -----------------------------------------------------------------------------
+void medirRPM(float dt) {
+  uint32_t n;
+  portENTER_CRITICAL(&muxHall);
+  n = pulsosHall;
+  pulsosHall = 0;
+  portEXIT_CRITICAL(&muxHall);
+
+  if (dt <= 0.0f || PPR <= 0.0f) {
+    frequencia = 0.0f;
+    rpmBruta   = 0.0f;
+    return;
+  }
+
+  frequencia = (float)n / dt;
+  rpmBruta   = frequencia * 60.0f / PPR;
+  PV         = FILTRO_PV * PV + (1.0f - FILTRO_PV) * rpmBruta;
+}
+
+// -----------------------------------------------------------------------------
+// INICIO DOS MODOS AUTOMATICOS E PID
+// -----------------------------------------------------------------------------
+void iniciarCicloRPM() {
+  modoAtual     = MODO_AUTO_RPM;
+  cicloNaMaxima = true;
+  SP            = spMax;
+  ultimaTrocaMs = millis();
+
+  erro       = SP - PV;
+  P          = Kp * erro;
+  D          = 0.0f;
+  I          = constrain(pwmPercentual - P, pwmMin, pwmMax);
+  PVAnterior = PV;
+}
+
+void iniciarCicloPWM() {
+  modoAtual     = MODO_AUTO_PWM;
+  cicloNaMaxima = true;
+  ultimaTrocaMs = millis();
+  aplicarPWM(pwmMax);
+}
+
+void calcularPID(float dt) {
+  if (dt <= 0.0f) return;
+
+  erro = SP - PV;
+  P = Kp * erro;
+  D = -Kd * (PV - PVAnterior) / dt;
+
+  const float novoI = I + Ki * erro * dt;
+  const float saidaTentativa = P + novoI + D;
+
+  if ((saidaTentativa >= pwmMin && saidaTentativa <= pwmMax) ||
+      (saidaTentativa > pwmMax && erro < 0.0f) ||
+      (saidaTentativa < pwmMin && erro > 0.0f)) {
+    I = novoI;
+  }
+
+  I  = constrain(I, pwmMin, pwmMax);
+  MV = constrain(P + I + D, pwmMin, pwmMax);
+  PVAnterior = PV;
+}
+
+// -----------------------------------------------------------------------------
+// SERIAL: COMANDOS E STATUS
+// -----------------------------------------------------------------------------
+bool converterNumero(String texto, float &valor) {
+  texto.trim();
+  texto.replace(',', '.');
+  if (texto.length() == 0) return false;
+
+  char *fim = nullptr;
+  valor = strtof(texto.c_str(), &fim);
+  return (fim != texto.c_str() && *fim == '\0' && isfinite(valor));
+}
+
+const char* nomeModo() {
+  switch (modoAtual) {
+    case MODO_MANUAL:   return "MANUAL";
+    case MODO_AUTO_RPM: return "AUTO_RPM";
+    case MODO_AUTO_PWM: return "AUTO_PWM";
+    default:            return "DESCONHECIDO";
+  }
+}
+
+void imprimirAjuda() {
+  Serial.println();
+  Serial.println(F("--- COMANDOS DISPONIVEIS ---"));
+  Serial.println(F("PWMMIN=30          : define PWM minimo (PID e AUTO_PWM)"));
+  Serial.println(F("PWMMAX=100         : define PWM maximo (PID e AUTO_PWM)"));
+  Serial.println(F("MAXP=80            : define PWM maximo e inicia AUTO_PWM"));
+  Serial.println(F("AUTOPWM            : ativa modo AUTO_PWM (PWM_MIN <-> PWM_MAX)"));
+  Serial.println(F("SP=4000 / MAX=4000 : modo AUTO_RPM alternando entre Max e Min"));
+  Serial.println(F("MIN=1000           : altera o RPM minimo do ciclo AUTO_RPM"));
+  Serial.println(F("AUTO               : ativa modo AUTO_RPM com o MAX atual"));
+  Serial.println(F("PWM=50             : modo MANUAL com PWM fixo (0 a 100%)"));
+  Serial.println(F("MANUAL             : ativa modo MANUAL mantendo PWM atual"));
+  Serial.println(F("TEMPO=5            : tempo em segundos de cada etapa do ciclo"));
+  Serial.println(F("KP= / KI= / KD=    : ajusta ganhos do PID"));
+  Serial.println(F("PPR=2              : pulsos por volta do Hall"));
+  Serial.println(F("STOP               : desliga a ventoinha (PWM=0%)"));
+  Serial.println(F("STATUS             : exibe parametros atuais"));
+  Serial.println();
+}
+
+void imprimirStatus() {
+  Serial.println(F("--- STATUS ---"));
+  Serial.print(F("Modo: "));        Serial.println(nomeModo());
+  Serial.print(F("PWM Minimo: "));  Serial.print(pwmMin, 1);        Serial.println(F(" %"));
+  Serial.print(F("PWM Maximo: "));  Serial.print(pwmMax, 1);        Serial.println(F(" %"));
+  Serial.print(F("SP Maximo: "));   Serial.print(spMax, 1);         Serial.println(F(" RPM"));
+  Serial.print(F("SP Minimo: "));   Serial.print(spMin, 1);         Serial.println(F(" RPM"));
+  Serial.print(F("PV Atual: "));    Serial.print(PV, 1);            Serial.println(F(" RPM"));
+  Serial.print(F("PWM Atual: "));   Serial.print(pwmPercentual, 1); Serial.println(F(" %"));
+  Serial.print(F("Tempo Ciclo: ")); Serial.print(tempoCicloMs / 1000.0f, 1); Serial.println(F(" s"));
+  Serial.print(F("Kp: "));          Serial.println(Kp, 6);
+  Serial.print(F("Ki: "));          Serial.println(Ki, 6);
+  Serial.print(F("Kd: "));          Serial.println(Kd, 6);
+  Serial.print(F("PPR: "));         Serial.println(PPR, 1);
+  Serial.println(F("--------------"));
+}
+
+void receberComandos() {
+  if (!Serial.available()) return;
+
+  String linha = Serial.readStringUntil('\n');
+  linha.trim();
+  if (linha.length() == 0) return;
+
+  linha.replace("ç", "c");
+  linha.replace("Ç", "C");
+  linha.replace("ã", "a");
+  linha.replace("Ã", "A");
+  linha.toUpperCase();
+
+  int posIgual = linha.indexOf('=');
+  if (posIgual > 0) {
+    String chave    = linha.substring(0, posIgual);
+    String valorStr = linha.substring(posIgual + 1);
+    chave.trim();
+    valorStr.trim();
+
+    float valor = 0.0f;
+
+    // Limite minimo de PWM (sem alterar o modo atual)
+    if (chave == "PWMMIN" || chave == "PWM_MIN" || chave == "MINP" || chave == "MINPWM") {
+      if (!converterNumero(valorStr, valor)) {
+        Serial.println(F("Valor de PWM_MIN invalido. Use de 0 a 100."));
+        return;
+      }
+      pwmMin = constrain(valor, 0.0f, pwmMax);
+      I  = constrain(I, pwmMin, pwmMax);
+      MV = constrain(MV, pwmMin, pwmMax);
+      Serial.print(F("Novo PWM Minimo: "));
+      Serial.print(pwmMin, 1);
+      Serial.println(F(" %"));
+      return;
+    }
+
+    // Limite maximo de PWM (sem alterar o modo atual)
+    if (chave == "PWMMAX" || chave == "PWM_MAX") {
+      if (!converterNumero(valorStr, valor)) {
+        Serial.println(F("Valor de PWM_MAX invalido. Use de 0 a 100."));
+        return;
+      }
+      pwmMax = constrain(valor, pwmMin, 100.0f);
+      I  = constrain(I, pwmMin, pwmMax);
+      MV = constrain(MV, pwmMin, pwmMax);
+      Serial.print(F("Novo PWM Maximo: "));
+      Serial.print(pwmMax, 1);
+      Serial.println(F(" %"));
+      return;
+    }
+
+    // Atalho legado: define PWM maximo e ativa AUTO_PWM (pwmMin <-> pwmMax)
+    if (chave == "MAXP" || chave == "MAXPWM") {
+      if (!converterNumero(valorStr, valor)) {
+        Serial.println(F("Valor de MaxP invalido. Use de 0 a 100."));
+        return;
+      }
+      pwmMax = constrain(valor, pwmMin, 100.0f);
+      iniciarCicloPWM();
+      Serial.print(F("Modo AUTO_PWM ativado! Alternando entre "));
+      Serial.print(pwmMin, 1);
+      Serial.print(F("% e "));
+      Serial.print(pwmMax, 1);
+      Serial.println(F("%."));
+      return;
+    }
+
+    // Modo AUTO_RPM: alterna entre spMax e spMin
+    if (chave == "SP" || chave == "MAX" || chave == "SET" || chave == "ROTACAO" || chave == "RPM") {
+      if (!converterNumero(valorStr, valor)) {
+        Serial.println(F("Valor de rotacao maxima invalido."));
+        return;
+      }
+      spMax = constrain(valor, spMin, RPM_LIMITE_MAX);
+      iniciarCicloRPM();
+      Serial.print(F("Modo AUTO_RPM ativado! Alternando entre "));
+      Serial.print(spMax, 0);
+      Serial.print(F(" RPM e "));
+      Serial.print(spMin, 0);
+      Serial.println(F(" RPM."));
+      return;
+    }
+
+    if (chave == "MIN") {
+      if (!converterNumero(valorStr, valor)) {
+        Serial.println(F("Valor de rotacao minima invalido."));
+        return;
+      }
+      spMin = constrain(valor, RPM_LIMITE_MIN, spMax);
+      Serial.print(F("Novo SP Minimo: "));
+      Serial.println(spMin, 1);
+      return;
+    }
+
+    if (chave == "PWM") {
+      if (!converterNumero(valorStr, valor)) {
+        Serial.println(F("Valor de PWM invalido."));
+        return;
+      }
+      modoAtual = MODO_MANUAL;
+      pwmManual = constrain(valor, 0.0f, 100.0f);
+      aplicarPWM(pwmManual);
+      Serial.print(F("Modo MANUAL | PWM: "));
+      Serial.print(pwmManual, 1);
+      Serial.println(F("%"));
+      return;
+    }
+
+    if (chave == "TEMPO") {
+      if (!converterNumero(valorStr, valor) || valor < 1.0f) {
+        Serial.println(F("Tempo invalido. Use valor >= 1 segundo."));
+        return;
+      }
+      tempoCicloMs = (uint32_t)(valor * 1000.0f);
+      Serial.print(F("Tempo de cada etapa: "));
+      Serial.print(valor, 1);
+      Serial.println(F(" s"));
+      return;
+    }
+
+    if (chave == "KP") {
+      if (converterNumero(valorStr, valor) && valor >= 0.0f) {
+        Kp = valor;
+        Serial.print(F("Novo Kp: ")); Serial.println(Kp, 6);
+      }
+      return;
+    }
+
+    if (chave == "KI") {
+      if (converterNumero(valorStr, valor) && valor >= 0.0f) {
+        Ki = valor;
+        Serial.print(F("Novo Ki: ")); Serial.println(Ki, 6);
+      }
+      return;
+    }
+
+    if (chave == "KD") {
+      if (converterNumero(valorStr, valor) && valor >= 0.0f) {
+        Kd = valor;
+        Serial.print(F("Novo Kd: ")); Serial.println(Kd, 6);
+      }
+      return;
+    }
+
+    if (chave == "PPR") {
+      if (converterNumero(valorStr, valor) && valor > 0.0f) {
+        PPR = valor;
+        Serial.print(F("Novo PPR: ")); Serial.println(PPR, 1);
+      }
+      return;
+    }
+  }
+
+  // Comandos diretos
+  if (linha == "MANUAL") {
+    modoAtual = MODO_MANUAL;
+    pwmManual = pwmPercentual;
+    Serial.println(F("Modo MANUAL ativado."));
+  }
+  else if (linha == "AUTO") {
+    iniciarCicloRPM();
+    Serial.print(F("Modo AUTO_RPM ativado! Alternando entre "));
+    Serial.print(spMax, 0);
+    Serial.print(F(" RPM e "));
+    Serial.print(spMin, 0);
+    Serial.println(F(" RPM."));
+  }
+  else if (linha == "AUTOPWM") {
+    iniciarCicloPWM();
+    Serial.print(F("Modo AUTO_PWM ativado! Alternando entre "));
+    Serial.print(pwmMin, 1);
+    Serial.print(F("% e "));
+    Serial.print(pwmMax, 1);
+    Serial.println(F("%."));
+  }
+  else if (linha == "STOP") {
+    modoAtual = MODO_MANUAL;
+    pwmManual = 0.0f;
+    MV        = 0.0f;
+    aplicarPWM(0.0f);
+    Serial.println(F("Ventoinha parada (PWM=0%)."));
+  }
+  else if (linha == "STATUS") {
+    imprimirStatus();
+  }
+  else if (linha == "HELP") {
+    imprimirAjuda();
+  }
+  else {
+    Serial.print(F("Comando desconhecido: "));
+    Serial.println(linha);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// SETUP
+// -----------------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  Serial.setTimeout(30);
+  delay(300);
+
+  pinMode(PWM_PIN, OUTPUT);
+  digitalWrite(PWM_PIN, LOW);
+  iniciarPWM();
+  aplicarPWM(0.0f);
+
+  pinMode(HALL_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN), contarPulso, FALLING);
+
+  tempoAnterior = millis();
+  ultimaTrocaMs = millis();
+
+  Serial.println(F("\nControle de Ventoinha iniciado."));
+  Serial.println(F("Limites padrao: PWM_MIN=30% | PWM_MAX=100%."));
+  Serial.println(F("Envie HELP para listar todos os comandos."));
+}
+
+// -----------------------------------------------------------------------------
+// LOOP PRINCIPAL
+// -----------------------------------------------------------------------------
+void loop() {
+  receberComandos();
+
+  const uint32_t agora = millis();
+  if ((uint32_t)(agora - tempoAnterior) < INTERVALO_MS) {
+    return;
+  }
+
+  const float dt = (agora - tempoAnterior) / 1000.0f;
+  tempoAnterior = agora;
+
+  medirRPM(dt);
+
+  if (modoAtual == MODO_AUTO_PWM) {
+    if ((uint32_t)(agora - ultimaTrocaMs) >= tempoCicloMs) {
+      ultimaTrocaMs = agora;
+      cicloNaMaxima = !cicloNaMaxima;
+    }
+    const float pwmAlvo = cicloNaMaxima ? pwmMax : pwmMin;
+    aplicarPWM(pwmAlvo);
+    MV         = pwmAlvo;
+    PVAnterior = PV;
+  }
+  else if (modoAtual == MODO_AUTO_RPM) {
+    if ((uint32_t)(agora - ultimaTrocaMs) >= tempoCicloMs) {
+      ultimaTrocaMs = agora;
+      cicloNaMaxima = !cicloNaMaxima;
+      SP = cicloNaMaxima ? spMax : spMin;
+    }
+    calcularPID(dt);
+    aplicarPWM(MV);
+  }
+  else {
+    aplicarPWM(pwmManual);
+    MV         = pwmManual;
+    PVAnterior = PV;
+  }
+
+  // Saida para Serial Monitor / Serial Plotter / App Python
+  Serial.print(F("Modo:"));  Serial.print(nomeModo());
+  Serial.print(F("\tSP:"));  Serial.print(SP, 1);
+  Serial.print(F("\tPV:"));  Serial.print(PV, 1);
+  Serial.print(F("\tPWM:")); Serial.print(pwmPercentual, 1);
+  Serial.print(F("\tHz:"));  Serial.println(frequencia, 1);
+}
